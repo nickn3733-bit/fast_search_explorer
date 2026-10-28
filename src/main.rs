@@ -478,6 +478,108 @@ fn open_containing_folder(full_path: &str) -> Result<(), String> {
 }
 
 // ============================================================================
+// 4b. ФАЙЛОВИЙ МЕНЕДЖЕР (ЛЕВА ПАНЕЛЬ: ЛЕНИВЕ ДЕРЕВО ПАПОК)
+// ============================================================================
+
+/// Вузол дерева файлової системи (ліниве завантаження дітей)
+#[derive(Clone, Debug)]
+struct FsNode {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+impl FastSearchApp {
+    /// Завантажити (з кешем) дочірні елементи папки. Символьні линки та
+    /// junction-и пропускаємо, щоб уникнути зациклення на системних папках.
+    fn load_children(&mut self, path: &str) -> Vec<FsNode> {
+        if let Some(nodes) = self.fs_children.get(path) {
+            return nodes.clone();
+        }
+        let mut nodes: Vec<FsNode> = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(path) {
+            for entry in read_dir.flatten() {
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if file_type.is_symlink() {
+                    continue; // обходимо junction-и та ярлики папок
+                }
+                nodes.push(FsNode {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path: entry.path().to_string_lossy().into_owned(),
+                    is_dir: file_type.is_dir(),
+                });
+            }
+        }
+        nodes.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        self.fs_children.insert(path.to_string(), nodes.clone());
+        nodes
+    }
+
+    /// Один рядок дерева: папка з розгортанням або файл із відкриттям
+    fn draw_fs_node(&mut self, ui: &mut egui::Ui, node: &FsNode, depth: usize) {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 14.0);
+            if node.is_dir {
+                let expanded = self.tree_expanded.contains(&node.path);
+                let icon = if expanded { "▾" } else { "▸" };
+                let label = truncate_fs_name(&node.name, 30);
+                let btn = ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("{} 📁 {}", icon, label)).size(13.0),
+                    )
+                    .frame(false),
+                );
+                if btn.clicked() {
+                    // Клік: перехід у папку (для фільтра результатів)
+                    self.current_folder = Some(node.path.clone());
+                    if expanded {
+                        self.tree_expanded.remove(&node.path);
+                    } else {
+                        self.tree_expanded.insert(node.path.clone());
+                    }
+                }
+                if btn.middle_clicked() {
+                    let _ = open_containing_folder(&node.path);
+                }
+                if expanded {
+                    let children = self.load_children(&node.path);
+                    for child in &children {
+                        self.draw_fs_node(ui, child, depth + 1);
+                    }
+                }
+            } else {
+                let label = truncate_fs_name(&node.name, 30);
+                let resp = ui.add(
+                    egui::Button::new(RichText::new(format!("📄 {}", label)).size(13.0))
+                        .frame(false),
+                );
+                if resp.double_clicked() {
+                    if let Err(e) = open_item(&node.path) {
+                        self.status_toast = Some((e, Instant::now(), true));
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Обрізає довгі імена для дерева
+fn truncate_fs_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        name.to_string()
+    } else {
+        format!("{}…", &name[..name.char_indices().nth(max - 1).map(|(i, _)| i).unwrap_or(max)])
+    }
+}
+
+// ============================================================================
 // 5. ГОЛОВНИЙ ДОДАТОК EFRAME / EGUI
 // ============================================================================
 
@@ -501,6 +603,13 @@ pub struct FastSearchApp {
     // Групове видалення: відмічені rec_idx у поточних результатах + діалог підтвердження
     checked: HashSet<usize>,
     delete_confirm: Option<Vec<String>>,
+
+    // Лівий файловий менеджер: лениве дерево папок + фільтр результатів за папкою
+    fs_children: HashMap<String, Vec<FsNode>>,
+    tree_expanded: HashSet<String>,
+    current_folder: Option<String>,
+    filter_by_folder: bool,
+    last_filter_key: String,
 
     // Фонова індексація
     crawler_rx: Receiver<CrawlerMessage>,
@@ -542,6 +651,11 @@ impl FastSearchApp {
             selected_row_idx: None,
             checked: HashSet::new(),
             delete_confirm: None,
+            fs_children: HashMap::new(),
+            tree_expanded: HashSet::new(),
+            current_folder: None,
+            filter_by_folder: true,
+            last_filter_key: "___INITIAL___".to_string(),
             crawler_rx: rx,
             crawler_tx: tx,
             cancel_flag,
@@ -564,23 +678,45 @@ impl FastSearchApp {
         app
     }
 
-    /// Виконання паралельного пошуку тільки коли змінився запит або версія індексу
+    /// Виконання паралельного пошуку тільки коли змінився запит, версія індексу
+    /// або вибрана папка-фільтр
     fn trigger_search_if_needed(&mut self) {
+        let filter_key = format!(
+            "{}|{}",
+            self.filter_by_folder,
+            self.current_folder.clone().unwrap_or_default()
+        );
         if self.search_query == self.last_searched_query
             && self.index_version == self.last_searched_version
+            && filter_key == self.last_filter_key
         {
-            return; // Запит не змінювався, повторний пошук не потрібен
+            return; // Нічого не змінилося — повторний пошук не потрібен
         }
 
         let start = Instant::now();
         let query_lower = self.search_query.trim().to_lowercase();
         self.cached_results = search_parallel(&self.index, &query_lower, 1000);
+
+        // Фільтр результатів за виділеною в дереві папкою
+        if self.filter_by_folder {
+            if let Some(folder) = &self.current_folder.clone() {
+                let prefix = folder.trim_end_matches(['\\', '/']);
+                self.cached_results.retain(|&rec_idx| {
+                    let rec = &self.index.records[rec_idx];
+                    self.index
+                        .get_dir(rec)
+                        .trim_end_matches(['\\', '/'])
+                        .eq_ignore_ascii_case(prefix)
+                });
+            }
+        }
         self.search_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         self.last_searched_query = self.search_query.clone();
         self.last_searched_version = self.index_version;
+        self.last_filter_key = filter_key;
 
-        // Коригуємо виділений рядок
+        self.checked.clear();
         if let Some(sel) = self.selected_row_idx {
             if sel >= self.cached_results.len() {
                 self.selected_row_idx = if self.cached_results.is_empty() {
@@ -799,6 +935,67 @@ impl eframe::App for FastSearchApp {
 
             ui.add_space(6.0);
         });
+
+        // Ліва панель: файловий менеджер (лениве дерево дисків і папок)
+        egui::SidePanel::left("fs_tree_panel")
+            .resizable(true)
+            .default_width(240.0)
+            .min_width(160.0)
+            .max_width(420.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🗂 Провідник").strong());
+                    // Фільтр результатів за виділеною папкою
+                    if ui
+                        .checkbox(&mut self.filter_by_folder, "Фільтр за папкою")
+                        .changed()
+                    {
+                        self.selected_row_idx = None;
+                    }
+                });
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if let Some(folder) = &self.current_folder {
+                        let short = truncate_fs_name(
+                            folder.trim_end_matches(['\\', '/']),
+                            44,
+                        );
+                        ui.label(
+                            RichText::new(format!("🔎 {}", short))
+                                .color(Color32::from_rgb(120, 210, 255))
+                                .strong(),
+                        );
+                        if ui.small_button("✖").clicked() {
+                            self.current_folder = None;
+                            self.selected_row_idx = None;
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Уся файлова система")
+                                .color(Color32::from_rgb(130, 140, 150))
+                                .weak(),
+                        );
+                    }
+                    if ui.small_button("🔄").on_hover_text("Оновити дерево папок").clicked() {
+                        self.fs_children.clear();
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(2.0);
+                    for drive in get_logical_drives() {
+                        let node = FsNode {
+                            name: drive.trim_end_matches(['\\', '/']).to_string(),
+                            path: drive.clone(),
+                            is_dir: true,
+                        };
+                        self.draw_fs_node(ui, &node, 0);
+                    }
+                });
+            });
 
         // Центральна віртуалізована таблиця результатів
         egui::CentralPanel::default().show(ctx, |ui| {
