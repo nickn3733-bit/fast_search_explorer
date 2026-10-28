@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Кеш індексу користувача
+*.bin
+
+# Node / збірки (на випадок повернення веб-частини)
+node_modules/
+build/
+dist/
+coverage/
+
+# IDE та ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Логи та локальні налаштування
+*.log
+.env*
+!.env.example
