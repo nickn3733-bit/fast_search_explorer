@@ -522,8 +522,11 @@ impl FastSearchApp {
         nodes
     }
 
-    /// Один рядок дерева: папка з розгортанням або файл із відкриттям
+    /// Один рядок дерева: папка з розгортанням або файл із відкриттям.
+    /// Дочірні елементи малюються ВЕРТИКАЛЬНО під батьківським рядком
+    /// (як у провідника), а не всередині горизонтального рядка.
     fn draw_fs_node(&mut self, ui: &mut egui::Ui, node: &FsNode, depth: usize) {
+        // Сам рядок (іконка + назва) — горизонтальний
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 14.0);
             if node.is_dir {
@@ -548,12 +551,6 @@ impl FastSearchApp {
                 if btn.middle_clicked() {
                     let _ = open_containing_folder(&node.path);
                 }
-                if expanded {
-                    let children = self.load_children(&node.path);
-                    for child in &children {
-                        self.draw_fs_node(ui, child, depth + 1);
-                    }
-                }
             } else {
                 let label = truncate_fs_name(&node.name, 30);
                 let resp = ui.add(
@@ -567,6 +564,14 @@ impl FastSearchApp {
                 }
             }
         });
+
+        // Розгорнуті діти: наступні РЯДКИ вниз (поза горизонтальним контейнером)
+        if node.is_dir && self.tree_expanded.contains(&node.path) {
+            let children = self.load_children(&node.path);
+            for child in &children {
+                self.draw_fs_node(ui, child, depth + 1);
+            }
+        }
     }
 }
 
@@ -695,21 +700,50 @@ impl FastSearchApp {
 
         let start = Instant::now();
         let query_lower = self.search_query.trim().to_lowercase();
-        self.cached_results = search_parallel(&self.index, &query_lower, 1000);
 
-        // Фільтр результатів за виділеною в дереві папкою
-        if self.filter_by_folder {
-            if let Some(folder) = &self.current_folder.clone() {
-                let prefix = folder.trim_end_matches(['\\', '/']);
-                self.cached_results.retain(|&rec_idx| {
-                    let rec = &self.index.records[rec_idx];
-                    self.index
-                        .get_dir(rec)
-                        .trim_end_matches(['\\', '/'])
-                        .eq_ignore_ascii_case(prefix)
-                });
-            }
+        // Режим «перегляд папки»: коли в дереві зліва вибрано папку,
+        // у головній таблиці показуємо весь безпосередній вміст цієї
+        // папки (як у провіднику), незалежно від ліміту 1000 пошуку.
+        let folder_view = self
+            .filter_by_folder
+            .then(|| self.current_folder.clone())
+            .flatten();
+
+        if let Some(folder) = folder_view {
+            let prefix = folder.trim_end_matches(['\\', '/']).to_lowercase();
+            // Індекси dedup-пулу папок, що відповідають вибраній папці,
+            // щоб один раз пройтися по всьому індексу без порівняння шляхів
+            let matched_dirs: HashSet<u32> = self
+                .index
+                .dir_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.trim_end_matches(['\\', '/']).to_lowercase() == prefix)
+                .map(|(i, _)| i as u32)
+                .collect();
+
+            self.cached_results = self
+                .index
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, rec)| matched_dirs.contains(&rec.dir_idx))
+                .filter(|(_, rec)| query_lower.is_empty() || self.index.get_lower(rec).contains(&query_lower))
+                .map(|(i, _)| i)
+                .collect();
+
+            // Як у провіднику: спочатку папки, потім файли, за алфавітом
+            self.cached_results.sort_by(|&a, &b| {
+                let ra = &self.index.records[a];
+                let rb = &self.index.records[b];
+                rb.is_dir
+                    .cmp(&ra.is_dir)
+                    .then_with(|| self.index.get_lower(ra).cmp(self.index.get_lower(rb)))
+            });
+        } else {
+            self.cached_results = search_parallel(&self.index, &query_lower, 1000);
         }
+
         self.search_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         self.last_searched_query = self.search_query.clone();
@@ -984,7 +1018,8 @@ impl eframe::App for FastSearchApp {
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink(false) // вертикальне дерево + гортання довгих назв
+                .show(ui, |ui| {
                     ui.add_space(2.0);
                     for drive in get_logical_drives() {
                         let node = FsNode {
